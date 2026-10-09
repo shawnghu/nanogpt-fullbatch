@@ -1,0 +1,251 @@
+--- a/track_1_short/config.py
++++ b/track_1_short/config.py
+@@ -30,7 +30,7 @@
+     # Every how many steps to evaluate val loss; 0 = only at the end (record #360: each intermediate
+     # validation is on the clock -- the val reads and n-gram pulls, the value_embeds gather, the drained
+     # CUDA-graph run-ahead and the cycle re-land after it cost ~0.2-0.5 s over a run at 250).
+-    val_loss_every: int = 0
++    val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", "0"))
+     save_checkpoint: bool = False
+     run_evals: bool = False  # run additional evaluations after training is completed
+     # reproducibility: unset means a random init; any integer (0 included) seeds it
+@@ -87,5 +87,41 @@
+     TrainingStage(train_max_seq_len=3072, batch_size=8 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used (lr sits at the floor)
+                   mtp_weights_start=[1.0], mtp_weights_end=[1.0], prefix_weights=(0.0,)),
+ ]
++
++# ---------------------------------------------------------------------------------------------
++# Ablation switches (nanogpt full-batch project). Defaults reproduce the stock record.
++#   ABL_FULL_SOFTMAX=1   no sampled softmax anywhere (sampled_softmax.py)
++#   ABL_FIXED=1          one fixed objective for the whole run: every stage identical to the
++#                        batch-24 stage (seq 3072 / cap 2560, windows (5,11), MTP [1.0], prefix 0,
++#                        batch 24*2048*8, lr_mul 1.73), no final window extension at validation
++#   ABL_EMBED=split|tied|untied   when ABL_FIXED: tied throughout (default) or untied from step 1
++#   ABL_BATCH_UNITS=<n>  when ABL_FIXED: constant batch of n*2048*8 tokens (default 24)
++#   ABL_FIXED_LR=stock|const  when ABL_FIXED: keep the stages' lr_mul as an LR schedule (default), or a
++#                        constant lr_mul of 1.73*sqrt(n/24) (the record's sqrt rule)
++#   ABL_NO_NGRAM=1       hashed n-gram table frozen at its zero init (ngram_table.py): contributes
++#                        exactly nothing; its compute/comms are still paid
++#   SUBSET_TOKENS=<n>    train on only the first n tokens of the first train shard, repeated (data.py)
++#   VAL_LOSS_EVERY=<n>   intermediate validations (plus train-subset loss when SUBSET_TOKENS is set)
++ABL_FULL_SOFTMAX = os.environ.get("ABL_FULL_SOFTMAX", "0") == "1"
++ABL_FIXED = os.environ.get("ABL_FIXED", "0") == "1"
++ABL_EMBED = os.environ.get("ABL_EMBED", "split" if not ABL_FIXED else "tied")
++ABL_NO_NGRAM = os.environ.get("ABL_NO_NGRAM", "0") == "1"
++SUBSET_TOKENS = int(os.environ.get("SUBSET_TOKENS", "0"))
++if ABL_FIXED:
++    _units = int(os.environ.get("ABL_BATCH_UNITS", "24"))
++    _fixed = dict(train_max_seq_len=3072, batch_size=_units * 2048 * 8, window_sizes=(5, 11),
++                  lr_mul=1.73 * (_units / 24) ** 0.5, mtp_weights_start=[1.0], mtp_weights_end=[1.0],
++                  prefix_weights=(0.0,))
++    # ABL_FIXED_LR=stock keeps each stage's lr_mul (1.0 -> 1.52 -> 1.73 -> taper -> floor) as a pure LR
++    # schedule (the record's batch ramp doubles as an LR warmup); const uses one lr_mul throughout.
++    if os.environ.get("ABL_FIXED_LR", "stock") == "stock":
++        TRAINING_STAGES = [TrainingStage(duration=s.duration, **{**_fixed, "lr_mul": s.lr_mul}) for s in TRAINING_STAGES]
++    else:
++        TRAINING_STAGES = [TrainingStage(duration=s.duration, **_fixed) for s in TRAINING_STAGES]
++    # ABL_VAL_EXT=1 keeps the record's eval-only long-window extension (11 -> 20 blocks) at the final
++    # validation; it does not touch the training objective.
++    WS_POST_YARN_EXT = 20 if os.environ.get("ABL_VAL_EXT", "0") == "1" else 11
++assert ABL_EMBED in ("split", "tied", "untied")
++
+ assert VIRTUAL_SEQ_CAP % BLOCK_SIZE == 0
+ assert any(s.train_max_seq_len > VIRTUAL_SEQ_CAP for s in TRAINING_STAGES), "VIRTUAL_SEQ_CAP would be inert"
+--- a/track_1_short/data.py
++++ b/track_1_short/data.py
+@@ -153,7 +153,7 @@
+     return torch.tensor(ends, dtype=cum_lengths.dtype)
+ 
+ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, staging: PinnedBatchStaging,
+-                               align_to_bos: bool = True):
++                               align_to_bos: bool = True, subset_tokens: int = 0):
+     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+     # staging: the pinned slots every batch's H2D copies go through (perf/pinned_batches.py)
+     rank = dist.get_rank()
+@@ -166,9 +166,19 @@
+ 
+     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
+     tokens = _load_data_shard(next(file_iter))
++    if subset_tokens:
++        # Ablation (nanogpt full-batch project): only the first subset_tokens tokens, repeated in the
++        # same order every epoch.
++        assert align_to_bos
++        parts = [tokens]
++        while sum(t.numel() for t in parts) < subset_tokens:
++            parts.append(_load_data_shard(next(file_iter)))
++        tokens = torch.cat(parts)[:subset_tokens].clone().pin_memory()
++        del parts
++        epoch = 0
+     if align_to_bos:
+         shard = Shard(tokens, world_size)
+-        next_shard_getter = Shard.load_async(next(file_iter), world_size)
++        next_shard_getter = Shard.load_async(next(file_iter), world_size) if not subset_tokens else None
+     else:
+         pos = 0  # for unaligned case
+ 
+@@ -181,6 +191,16 @@
+                 seq_starts, seq_ends = shard.next_batch(num_tokens_local, max_seq_len)
+                 start_idxs, end_idxs = torch.tensor(seq_starts[rank]), torch.tensor(seq_ends[rank])
+             except StopIteration:
++                if subset_tokens:
++                    partial = shard.bos_idx is not shard._full_idx
++                    shard._loader_thread.join(); shard._ready.wait(); shard._maybe_switch()
++                    if partial:
++                        continue  # only the partial BOS index ran out (async scan still going): not an epoch end
++                    shard.i = 0
++                    epoch += 1
++                    if rank == 0:
++                        print(f"[subset] epoch {epoch} starts", flush=True)
++                    continue
+                 # This shard is exhausted, load the next one in the next loop iteration.
+                 shard = next_shard_getter()
+                 tokens = shard.tokens
+--- a/track_1_short/distributed.py
++++ b/track_1_short/distributed.py
+@@ -25,7 +25,8 @@
+     rank = int(os.environ["RANK"])
+     world_size = int(os.environ["WORLD_SIZE"])
+     # The sampled softmax and the sparse row exchanges assume one microbatch per step on 8 ranks.
+-    assert world_size == WORLD_SIZE, f"track 1 runs on exactly {WORLD_SIZE} GPUs, got world_size={world_size}"
++    # Ablation (nanogpt full-batch project): ABL_ALLOW_WORLD_SIZE=1 permits 4-rank runs (same global batch).
++    assert world_size == WORLD_SIZE or (os.environ.get("ABL_ALLOW_WORLD_SIZE") == "1" and 8 % world_size == 0), f"track 1 runs on exactly {WORLD_SIZE} GPUs, got world_size={world_size}"
+     assert torch.cuda.is_available()
+     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+     torch.cuda.set_device(device)
+--- a/track_1_short/ngram_table.py
++++ b/track_1_short/ngram_table.py
+@@ -70,6 +70,11 @@
+ # Adam for the table (record #360). lr and weight decay are Adam's scheduled base values times these
+ # multipliers; beta1 is 0 for the whole run.
+ NGRAM_LR_MUL = 70.0
++# Ablation (nanogpt full-batch project): ABL_NO_NGRAM=1 freezes the zero-initialized table, so it
++# contributes exactly nothing to the forward (step_size and decay below are both 0).
++import os as _os
++if _os.environ.get("ABL_NO_NGRAM", "0") == "1":
++    NGRAM_LR_MUL = 0.0
+ NGRAM_WD_MUL = 5.0
+ NGRAM_ADAM_BETA2 = 0.95
+ # From this step the table updates every 4th step instead of every 2nd (record #360). One event then
+--- a/track_1_short/sampled_softmax.py
++++ b/track_1_short/sampled_softmax.py
+@@ -47,6 +47,9 @@
+     1: (10240,),
+     2: (14336, 14336, 24576),
+ }
++from track_1_short.config import ABL_FULL_SOFTMAX
++if ABL_FULL_SOFTMAX:
++    CANDIDATES_BY_STAGE = {}
+ ALL_CANDIDATE_COUNTS = tuple(sorted({p for counts in CANDIDATES_BY_STAGE.values() for p in counts}))
+ # Coprime with the vocabulary, so k * stride mod V is a permutation (record #360).
+ NEGATIVE_STRIDE = 20011
+@@ -154,8 +157,8 @@
+         self.rank, self.world_size = rank, world_size
+         self.counts = [candidate_count_at(schedule, s) for s in range(schedule.total_steps + 1)]
+         p_values = sorted(set(self.counts) - {0})
+-        assert p_values
+-        max_p = max(p_values)
++        assert p_values or ABL_FULL_SOFTMAX
++        max_p = max(p_values) if p_values else 2048  # full softmax only: inert buffers
+         self.builder = CandidateBuilder(vocab_size, max_p, max_rows)
+         self.staging = CandidateStaging(max_candidates=max_p, max_rows=max_rows, device=device)
+         self.prefix_table = None  # host copy of model.prefix_table, set once it is built
+--- a/track_1_short/schedule.py
++++ b/track_1_short/schedule.py
+@@ -3,7 +3,7 @@
+ 
+ import torch
+ 
+-from track_1_short.config import SCHEDULE_GROWTH_STAGE, SCHEDULE_GROWTH_STEPS, TrainingStage
++from track_1_short.config import ABL_EMBED, SCHEDULE_GROWTH_STAGE, SCHEDULE_GROWTH_STEPS, TrainingStage
+ 
+ # The lr cooldown decays linearly to this absolute multiplier (record #360's code; its README says 0.20).
+ LR_FLOOR = 0.30
+@@ -41,6 +41,10 @@
+ 
+         # Split embed at specified stage (ensure odd step for Adam)
+         self.split_step = self.boundaries[split_embed_stage][0] | 1
++        if ABL_EMBED == "tied":
++            self.split_step = None  # never unties
++        elif ABL_EMBED == "untied":
++            self.split_step = 1  # unties after the first Adam step
+ 
+         # Precompute MTP weights and prefix-prediction weights for all steps
+         self.mtp_weights = []
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -32,6 +32,7 @@
+ # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+ from track_1_short.canonical_mask import BackgroundCanonicalMask
+ from track_1_short.config import (
++    SUBSET_TOKENS,
+     LR_COOLDOWN_FRAC,
+     SPLIT_EMBED_STAGE,
+     TRAINING_STAGES,
+@@ -130,10 +131,13 @@
+     def train_loader():
+         return distributed_data_generator(
+             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
++            subset_tokens=SUBSET_TOKENS,
+         )
+ 
+-    def val_loader():
+-        return distributed_data_generator(args.val_files, args.val_batch_size, -1, batch_staging, align_to_bos=False)
++    def val_loader(files=None):
++        return distributed_data_generator(files or args.val_files, args.val_batch_size, -1, batch_staging, align_to_bos=False)
++    # Also evaluate the loss on the first val_tokens of the training data (seen data when SUBSET_TOKENS).
++    eval_train = os.environ.get("EVAL_TRAIN", "1" if SUBSET_TOKENS else "0") == "1"
+ 
+     training_schedule = TrainingSchedule(
+         TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, device=env.device,
+@@ -224,11 +228,12 @@
+     # (a new optimizer path for embed)
+     split_step = training_schedule.split_step
+     compile_steps = sorted({0, 1} | {s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 2}
+-                           | {split_step + offset for offset in [1, 2, 3] if split_step + offset < training_schedule.total_steps})
++                           | ({split_step + offset for offset in [1, 2, 3] if split_step + offset < training_schedule.total_steps}
++                              if split_step is not None else set()))
+     # Plus the visits the graph captures and their self-checks need (perf/cuda_graphs/capture_plan.py).
+     capture_plan = plan_warmup(compile_steps, step_keys, training_manager.is_adam_step, FP8_EXACT_SCALE_CALLS)
+     warmup_steps = capture_plan.steps
+-    assert split_step in warmup_steps, "the embed split must happen during warmup for the steps after it to be warm"
++    assert split_step is None or split_step in warmup_steps, "the embed split must happen during warmup for the steps after it to be warm"
+     sampled_softmax.assert_warmup_covers(warmup_steps)
+     print0(f"Sampling steps {warmup_steps} for warmup; {len(capture_plan.visits)} step-graph configurations "
+            f"(warmup visits {sorted(capture_plan.visits.values())}); optimizer graphs captured at step "
+@@ -349,6 +354,27 @@
+             # below lands each batch's rows again (same routes, no new exchange) right before its forward.
+             assert args.val_tokens % args.val_batch_size == 0
+             val_steps = args.val_tokens // args.val_batch_size
++            train_eval_loss = None
++            if eval_train:
++                # Untimed: the train-split loss, on the same unaligned val-style batches.
++                torch.cuda.synchronize()
++                training_time_ms += 1000 * (time.perf_counter() - t0)
++                tl_iter = val_loader(args.train_files)
++                tl_batches = [next(tl_iter) for _ in range(val_steps)]
++                del tl_iter
++                tl_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in tl_batches])
++                model.eval()
++                train_eval_loss = 0
++                with torch.no_grad():
++                    for batch, pull in zip(tl_batches, tl_pulls):
++                        ngram_table.land(pull)
++                        train_eval_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
++                                                 training_manager.get_forward_args()).mean()
++                train_eval_loss /= val_steps
++                del tl_batches, tl_pulls
++                dist.reduce(train_eval_loss, 0, op=dist.ReduceOp.AVG)
++                torch.cuda.synchronize()
++                t0 = time.perf_counter()
+             val_loader_iter = val_loader()
+             val_batches = [next(val_loader_iter) for _ in range(val_steps)]
+             del val_loader_iter
+@@ -368,6 +394,8 @@
+             val_loss /= val_steps
+             del val_batches, val_pulls
+             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
++            if train_eval_loss is not None:
++                print0(f"step:{step}/{training_schedule.total_steps} train_eval_loss:{train_eval_loss:.4f}", console=True)
+             print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+             # The clock is stopped: flush the log and collect the loop's garbage here.
+             flush_log()

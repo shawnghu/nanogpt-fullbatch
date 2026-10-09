@@ -1,0 +1,1 @@
+COMMON=(train_fb.py mode=full dataset_tokens=800000000 steps=350 lr_mul=1.2 train_eval_tokens=10027008 train_eval_every=5 val_tokens=10485760 dyn=True dyn_preset=lean dyn_raw_exclude=value_embeds token_loss_every=10 ckpt_minutes=1.5 ckpt_keep=2 ckpt_milestone_every=50 partial_minutes=2)
