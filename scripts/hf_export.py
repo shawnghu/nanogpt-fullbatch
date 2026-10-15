@@ -154,13 +154,14 @@ def ckpt():
         out = OUT / "full_batch/checkpoints" / f"step_{step:06d}"
         if (out / "DONE").exists():
             continue
-        out.mkdir(parents=True, exist_ok=True)
+        (out / "resume_state").mkdir(parents=True, exist_ok=True)
         for r in range(4):
             st = torch.load(f"{d}/rank{r}.pt", map_location="cpu", weights_only=False)
             if r == 0:
                 save_file({k: v.contiguous() for k, v in st["params"].items()}, str(out / "model.safetensors"),
                           metadata={"step": str(step)})
-                save_file({k: v.contiguous() for k, v in st["buffers"].items()}, str(out / "resume_state/buffers.safetensors"))
+            # per rank: two activation-scale buffers (_mlp_post_scales, _mlp_dpre_scales) differ across ranks
+            save_file({k: v.contiguous() for k, v in st["buffers"].items()}, str(out / f"resume_state/buffers_rank{r}.safetensors"))
             opt_t, opt_meta = {}, {}
             for label, sd in st["optimizer"].items():
                 for k, v in sd.items():
